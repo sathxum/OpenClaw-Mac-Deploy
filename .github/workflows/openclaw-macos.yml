@@ -44,7 +44,7 @@ jobs:
       - name: "0/8 Preflight (macOS + root check)"
         run: |
           set -Eeuo pipefail
-          echo "::notice::OpenClaw Deployer v2026.5.1 // macOS // dual-tunnel // root-mode"
+          echo "::notice::OpenClaw Deployer v2026.6.0 // macOS // dual-tunnel // root-mode"
           sw_vers || true
           echo "arch: $(uname -m) | runner: $RUNNER_NAME"
           echo "ARCH=$(uname -m)" >> "$GITHUB_ENV"
@@ -145,6 +145,7 @@ jobs:
             },
             "tools": {"elevated": {"enabled": True}},
             "gateway": {
+              "mode": "local",
               "bind": "loopback",
               "port": 18789,
               "auth": {"mode": "password", "password": os.environ["AUTH_PASS"]}
@@ -169,12 +170,12 @@ jobs:
           mv "$ENVF.tmp" "$ENVF" 2>/dev/null || true
           echo "OPENCLAW_GATEWAY_PASSWORD=$AUTH_PASS" >> "$ENVF"
           chmod 600 "$ENVF"
-          echo "::notice::Config done: sandbox=OFF (root host sessions), elevated=ON, gateway password auth"
+          echo "::notice::Config done: sandbox=OFF (root host sessions), elevated=ON, gateway password auth, gateway.mode=local"
 
       - name: "5/8 Start Gateway + Auth Proxy (Basic-Auth edge)"
         run: |
           set -Eeuo pipefail
-          nohup openclaw gateway --bind loopback --port 18789 > /tmp/openclaw-gw.log 2>&1 &
+          nohup openclaw gateway --bind loopback --port 18789 --allow-unconfigured > /tmp/openclaw-gw.log 2>&1 &
           echo $! > /tmp/gw.pid
           ok=""
           for i in $(seq 1 60); do
@@ -407,7 +408,7 @@ jobs:
             i=$((i + 1))
             if ! curl -s -o /dev/null --max-time 3 http://127.0.0.1:18789; then
               echo "::warning::min $i: gateway down - restarting"
-              nohup openclaw gateway --bind loopback --port 18789 >> /tmp/openclaw-gw.log 2>&1 &
+              nohup openclaw gateway --bind loopback --port 18789 --allow-unconfigured >> /tmp/openclaw-gw.log 2>&1 &
               echo $! > /tmp/gw.pid
             fi
             if ! curl -s -o /dev/null --max-time 3 http://127.0.0.1:8080; then
