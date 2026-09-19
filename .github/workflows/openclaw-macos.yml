@@ -1,0 +1,419 @@
+name: Deploy OpenClaw (macOS // 2026)
+
+run-name: "OpenClaw macOS // run ${{ github.run_number }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      auth_username:
+        description: "Auth username (empty = TEMPORARY random)"
+        required: false
+        default: ""
+      auth_password:
+        description: "Auth password (empty = TEMPORARY random)"
+        required: false
+        default: ""
+      model_provider:
+        description: "Model provider: openrouter | openai | anthropic"
+        required: false
+        default: "openrouter"
+      model_api_key:
+        description: "Model API key (optional)"
+        required: false
+        default: ""
+      ngrok_authtoken:
+        description: "ngrok authtoken (empty = repo secret NGROK_AUTHTOKEN)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openclaw-macos-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  openclaw:
+    runs-on: macos-latest
+    timeout-minutes: 355
+    env:
+      ENABLE_CF: "1"
+      ENABLE_NGROK: "0"
+    steps:
+      - name: "0/8 Preflight (macOS + root check)"
+        run: |
+          set -Eeuo pipefail
+          echo "::notice::OpenClaw Deployer v2026.5.1 // macOS // dual-tunnel // root-mode"
+          sw_vers || true
+          echo "arch: $(uname -m) | runner: $RUNNER_NAME"
+          echo "ARCH=$(uname -m)" >> "$GITHUB_ENV"
+          ROOTCHK="$(sudo -n whoami 2>/dev/null || echo none)"
+          echo "root check: sudo whoami = $ROOTCHK (root = agent ko full root access milega)"
+          df -h / | tail -1
+
+      - name: "1/8 Setup Node 26"
+        uses: actions/setup-node@v5
+        with:
+          node-version: "26"
+
+      - name: "2/8 Prepare Auth Credentials (TEMPORARY / CUSTOM)"
+        env:
+          IN_USER: ${{ inputs.auth_username }}
+          IN_PASS: ${{ inputs.auth_password }}
+          IN_MPROV: ${{ inputs.model_provider }}
+          IN_MKEY: ${{ inputs.model_api_key }}
+        run: |
+          set -Eeuo pipefail
+          if [ -n "$IN_USER" ] && [ -n "$IN_PASS" ]; then
+            echo "AUTH_MODE=CUSTOM" >> "$GITHUB_ENV"
+            AUTH_USER="$IN_USER"
+            AUTH_PASS="$IN_PASS"
+            echo "::add-mask::$AUTH_PASS"
+            ULEN="$(printf '%s' "$AUTH_USER" | wc -c | tr -d ' ')"
+            PLEN="$(printf '%s' "$AUTH_PASS" | wc -c | tr -d ' ')"
+            if [ "$ULEN" -lt 3 ]; then echo "::error::Auth username must be at least 3 characters (got $ULEN)"; exit 1; fi
+            if [ "$PLEN" -lt 8 ]; then echo "::error::Auth password must be at least 8 characters (got $PLEN)"; exit 1; fi
+            if ! printf '%s' "$AUTH_PASS" | grep -q '[A-Z]'; then echo "::error::password needs at least one UPPERCASE letter"; exit 1; fi
+            if ! printf '%s' "$AUTH_PASS" | grep -q '[a-z]'; then echo "::error::password needs at least one lowercase letter"; exit 1; fi
+            if ! printf '%s' "$AUTH_PASS" | grep -q '[0-9]'; then echo "::error::password needs at least one digit"; exit 1; fi
+            echo "::notice::CUSTOM credentials accepted (masked in logs)"
+          else
+            echo "AUTH_MODE=TEMPORARY" >> "$GITHUB_ENV"
+            AUTH_USER="admin"
+            GEN="$(openssl rand -base64 30 | tr -dc 'A-Za-z0-9' | head -c 13)"
+            AUTH_PASS="$(printf '%sXy9' "$GEN")"
+            echo "::notice::TEMPORARY credentials generated - run ke saath khatam honge"
+          fi
+          echo "::add-mask::$AUTH_PASS"
+          {
+            echo "AUTH_USER=$AUTH_USER"
+            echo "AUTH_PASS=$AUTH_PASS"
+          } >> "$GITHUB_ENV"
+          case "$IN_MPROV" in
+            openai) KEYVAR="OPENAI_API_KEY" ;;
+            anthropic) KEYVAR="ANTHROPIC_API_KEY" ;;
+            *) KEYVAR="OPENROUTER_API_KEY" ;;
+          esac
+          echo "MODEL_KEYVAR=$KEYVAR" >> "$GITHUB_ENV"
+          if [ -n "$IN_MKEY" ]; then
+            echo "::add-mask::$IN_MKEY"
+            echo "MODEL_KEY=$IN_MKEY" >> "$GITHUB_ENV"
+            echo "::notice::Model key set for $KEYVAR (masked)"
+          else
+            echo "MODEL_KEY=" >> "$GITHUB_ENV"
+            echo "::notice::No model key - Control UI > Settings se baad mein daal sakte ho"
+          fi
+
+      - name: "3/8 Install OpenClaw (npm + official fallback)"
+        run: |
+          set -Eeuo pipefail
+          export PATH="$HOME/.openclaw/bin:$PATH"
+          echo "node $(node --version) | npm $(npm --version)"
+          if ! command -v openclaw >/dev/null 2>&1; then
+            echo "Installing OpenClaw via npm (allow-scripts shield)..."
+            npm install -g openclaw@latest --allow-scripts=openclaw > /tmp/npm-openclaw.log 2>&1 || npm install -g openclaw@latest >> /tmp/npm-openclaw.log 2>&1
+          fi
+          if ! command -v openclaw >/dev/null 2>&1; then
+            echo "::warning::npm path failed - trying official installer script (install.sh --no-onboard)"
+            curl -fsSL https://openclaw.ai/install.sh | bash -s -- --no-onboard > /tmp/oc-install.log 2>&1 || true
+            export PATH="$HOME/.openclaw/bin:$PATH"
+          fi
+          if ! command -v openclaw >/dev/null 2>&1; then
+            echo "::error::OpenClaw install failed - dumping logs"
+            tail -40 /tmp/npm-openclaw.log 2>/dev/null || true
+            tail -40 /tmp/oc-install.log 2>/dev/null || true
+            exit 1
+          fi
+          echo "OPENCLAW_BIN=$(command -v openclaw)" >> "$GITHUB_ENV"
+          echo "::notice::OpenClaw installed at $(command -v openclaw)"
+
+      - name: "4/8 Configure OpenClaw (password auth + ROOT mode)"
+        env:
+          MODEL_KEYVAR: ${{ env.MODEL_KEYVAR }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$HOME/.openclaw/workspace"
+          python3 - <<'PY'
+          import json, os
+          cfg = {
+            "agents": {
+              "defaults": {
+                "workspace": os.path.expanduser("~/.openclaw/workspace"),
+                "sandbox": {"mode": "off"}
+              }
+            },
+            "tools": {"elevated": {"enabled": True}},
+            "gateway": {
+              "bind": "loopback",
+              "port": 18789,
+              "auth": {"mode": "password", "password": os.environ["AUTH_PASS"]}
+            }
+          }
+          p = os.path.expanduser("~/.openclaw/openclaw.json")
+          os.makedirs(os.path.dirname(p), exist_ok=True)
+          with open(p, "w") as f:
+            json.dump(cfg, f, indent=2)
+          print("config written:", p)
+          PY
+          chmod 600 "$HOME/.openclaw/openclaw.json"
+          ENVF="$HOME/.openclaw/.env"
+          touch "$ENVF"
+          if [ -n "$MODEL_KEY" ]; then
+            grep -v "$MODEL_KEYVAR" "$ENVF" > "$ENVF.tmp" 2>/dev/null || true
+            mv "$ENVF.tmp" "$ENVF" 2>/dev/null || true
+            echo "$MODEL_KEYVAR=$MODEL_KEY" >> "$ENVF"
+            echo "::notice::model key written to ~/.openclaw/.env ($MODEL_KEYVAR)"
+          fi
+          grep -v "OPENCLAW_GATEWAY_PASSWORD" "$ENVF" > "$ENVF.tmp" 2>/dev/null || true
+          mv "$ENVF.tmp" "$ENVF" 2>/dev/null || true
+          echo "OPENCLAW_GATEWAY_PASSWORD=$AUTH_PASS" >> "$ENVF"
+          chmod 600 "$ENVF"
+          echo "::notice::Config done: sandbox=OFF (root host sessions), elevated=ON, gateway password auth"
+
+      - name: "5/8 Start Gateway + Auth Proxy (Basic-Auth edge)"
+        run: |
+          set -Eeuo pipefail
+          nohup openclaw gateway --bind loopback --port 18789 > /tmp/openclaw-gw.log 2>&1 &
+          echo $! > /tmp/gw.pid
+          ok=""
+          for i in $(seq 1 60); do
+            if curl -s -o /dev/null --max-time 2 http://127.0.0.1:18789; then ok=1; break; fi
+            if ! kill -0 "$(cat /tmp/gw.pid)" 2>/dev/null; then
+              echo "::error::gateway process died - last log lines:"
+              tail -40 /tmp/openclaw-gw.log || true
+              exit 1
+            fi
+            sleep 3
+          done
+          if [ -z "$ok" ]; then
+            echo "::error::gateway not ready in 180s"
+            tail -60 /tmp/openclaw-gw.log || true
+            exit 1
+          fi
+          echo "::notice::OpenClaw Gateway UP on 127.0.0.1:18789"
+          openclaw doctor > /tmp/doctor.log 2>&1 || true
+          tail -15 /tmp/doctor.log || true
+          cat > /tmp/auth-proxy.js <<'PROXYEOF'
+          const http = require('http');
+          const net = require('net');
+          const crypto = require('crypto');
+          const USER = process.env.AUTH_USER || '';
+          const PASS = process.env.AUTH_PASS || '';
+          const GH = '127.0.0.1', GP = 18789, LP = 8080;
+          function check(auth) {
+            if (!USER || !PASS) return false;
+            if (!auth || auth.indexOf('Basic ') !== 0) return false;
+            let dec = '';
+            try { dec = Buffer.from(auth.slice(6), 'base64').toString('utf8'); } catch (e) { return false; }
+            const idx = dec.indexOf(':');
+            if (idx < 0) return false;
+            const u = dec.slice(0, idx), p = dec.slice(idx + 1);
+            const a = Buffer.from(u + ':' + p);
+            const b = Buffer.from(USER + ':' + PASS);
+            return a.length === b.length && crypto.timingSafeEqual(a, b);
+          }
+          function deny(res) {
+            res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="OpenClaw"', 'Content-Type': 'text/html; charset=utf-8' });
+            res.end('<html><body style="background:#05080a;color:#00ff9d;font-family:monospace;padding:40px"><h1>401 — OpenClaw</h1><p>Auth required. Browser popup mein username + password daalo.</p></body></html>');
+          }
+          const server = http.createServer(function (req, res) {
+            if (!check(req.headers.authorization)) { deny(res); return; }
+            const h = Object.assign({}, req.headers);
+            h['host'] = GH + ':' + GP;
+            h['origin'] = 'http://' + GH + ':' + GP;
+            h['referer'] = 'http://' + GH + ':' + GP;
+            const preq = http.request({ host: GH, port: GP, path: req.url, method: req.method, headers: h }, function (pres) {
+              res.writeHead(pres.statusCode || 502, pres.headers);
+              pres.pipe(res);
+            });
+            preq.on('error', function () { try { res.writeHead(502); res.end('bad gateway'); } catch (e) {} });
+            req.pipe(preq);
+          });
+          server.on('upgrade', function (req, socket, head) {
+            if (!check(req.headers.authorization)) { socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n'); return; }
+            const lines = [];
+            const rh = req.rawHeaders;
+            for (let i = 0; i < rh.length; i += 2) {
+              const n = rh[i].toLowerCase();
+              if (n === 'origin' || n === 'host' || n === 'referer') continue;
+              lines.push(rh[i] + ': ' + rh[i + 1]);
+            }
+            lines.push('Host: ' + GH + ':' + GP);
+            lines.push('Origin: http://' + GH + ':' + GP);
+            lines.push('Referer: http://' + GH + ':' + GP);
+            const raw = 'GET ' + req.url + ' HTTP/1.1\r\n' + lines.join('\r\n') + '\r\n\r\n';
+            const up = net.connect(GP, GH, function () {
+              up.write(raw);
+              if (head && head.length) up.write(head);
+              up.pipe(socket);
+              socket.pipe(up);
+            });
+            up.on('error', function () { try { socket.end(); } catch (e) {} });
+            socket.on('error', function () { try { up.end(); } catch (e) {} });
+          });
+          server.listen(LP, '127.0.0.1', function () { console.log('[auth-proxy] 127.0.0.1:' + LP + ' -> gateway :' + GP); });
+          PROXYEOF
+          nohup node /tmp/auth-proxy.js > /tmp/proxy.log 2>&1 &
+          sleep 2
+          code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 http://127.0.0.1:8080/ || true)"
+          if [ "$code" != "401" ]; then
+            echo "::error::auth proxy not challenging requests (expected 401, got: $code)"
+            tail -25 /tmp/proxy.log || true
+            exit 1
+          fi
+          code2="$(curl -s -u "$AUTH_USER:$AUTH_PASS" -o /dev/null -w '%{http_code}' --max-time 8 http://127.0.0.1:8080/ || true)"
+          if [ -z "$code2" ] || [ "$code2" = "401" ] || [ "$code2" = "502" ]; then
+            echo "::error::auth proxy -> gateway chain broken (with creds got: $code2)"
+            tail -25 /tmp/proxy.log || true
+            exit 1
+          fi
+          echo "::notice::Auth proxy verified: no-creds=401, with-creds=$code2 (gateway chain OK)"
+
+      - name: "6/8 Tunnels (Cloudflare + ngrok) + URLs"
+        env:
+          NGROK_SECRET: ${{ secrets.NGROK_AUTHTOKEN }}
+          NGROK_INPUT: ${{ inputs.ngrok_authtoken }}
+        run: |
+          set -Eeuo pipefail
+          NGROK_AUTHTOKEN="$NGROK_INPUT"
+          if [ -z "$NGROK_AUTHTOKEN" ]; then NGROK_AUTHTOKEN="$NGROK_SECRET"; fi
+          if [ -n "$NGROK_AUTHTOKEN" ]; then echo "::add-mask::$NGROK_AUTHTOKEN"; fi
+          CF_URL=""
+          NGROK_URL=""
+          case "$(uname -m)" in
+            arm64) TARCH="arm64" ;;
+            *) TARCH="amd64" ;;
+          esac
+          if [ "$ENABLE_CF" = "1" ]; then
+            echo "Starting Cloudflare quick tunnel..."
+            curl -fsSL --retry 3 --max-time 120 -o /tmp/cf.tgz "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-$TARCH.tgz" || true
+            if [ -s /tmp/cf.tgz ]; then
+              tar -xzf /tmp/cf.tgz -C /tmp && chmod +x /tmp/cloudflared
+              nohup /tmp/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8080 > /tmp/cf.log 2>&1 &
+              for i in $(seq 1 30); do
+                CF_URL="$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' /tmp/cf.log | head -1 || true)"
+                if [ -n "$CF_URL" ]; then break; fi
+                if ! kill -0 "$(pgrep -f 'cloudflared tunnel' | head -1)" 2>/dev/null; then echo "::warning::cloudflared died"; break; fi
+                sleep 2
+              done
+            else
+              echo "::warning::cloudflared download failed"
+            fi
+          fi
+          if [ "$ENABLE_NGROK" = "1" ]; then
+            if [ -z "$NGROK_AUTHTOKEN" ]; then
+              echo "::warning::ngrok token missing (input + secret dono khali) - ngrok skipped"
+            else
+              echo "Starting ngrok tunnel..."
+              curl -fsSL --retry 3 --max-time 120 -o /tmp/ngrok.zip "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-darwin-$TARCH.zip" || true
+              if [ -s /tmp/ngrok.zip ]; then
+                mkdir -p /tmp/ngrokbin && unzip -o /tmp/ngrok.zip -d /tmp/ngrokbin > /dev/null
+                NGROK_BIN="/tmp/ngrokbin/ngrok"
+                chmod +x "$NGROK_BIN"
+                "$NGROK_BIN" config add-authtoken "$NGROK_AUTHTOKEN"
+                nohup "$NGROK_BIN" http 8080 --log stdout > /tmp/ngrok.log 2>&1 &
+                for i in $(seq 1 30); do
+                  NGROK_URL="$(curl -s --max-time 3 http://127.0.0.1:4040/api/tunnels | grep -o '"public_url":"https://[^"]*"' | head -1 | cut -d'"' -f4 || true)"
+                  if [ -n "$NGROK_URL" ]; then break; fi
+                  sleep 2
+                done
+              else
+                echo "::warning::ngrok download failed"
+              fi
+            fi
+          fi
+          if [ -z "$CF_URL" ] && [ -z "$NGROK_URL" ]; then
+            echo "::error::NO tunnel came up - dumping tunnel logs"
+            tail -30 /tmp/cf.log 2>/dev/null || true
+            tail -30 /tmp/ngrok.log 2>/dev/null || true
+            exit 1
+          fi
+          {
+            echo "CF_URL=$CF_URL"
+            echo "NGROK_URL=$NGROK_URL"
+          } >> "$GITHUB_ENV"
+          python3 - <<'PY'
+          import json, os
+          p = os.path.expanduser('~/.openclaw/openclaw.json')
+          try:
+              cfg = json.load(open(p))
+          except Exception:
+              cfg = {}
+          gw = cfg.setdefault('gateway', {})
+          ui = gw.setdefault('controlUi', {})
+          origins = [u for u in (os.environ.get('CF_URL', '').strip(), os.environ.get('NGROK_URL', '').strip()) if u]
+          if origins:
+              ui['allowedOrigins'] = origins
+          with open(p, 'w') as f:
+              json.dump(cfg, f, indent=2)
+          print('controlUi.allowedOrigins =', origins)
+          PY
+          PRIMARY="$CF_URL"
+          if [ -z "$PRIMARY" ]; then PRIMARY="$NGROK_URL"; fi
+          echo "::notice::TUNNELS UP -> $PRIMARY"
+
+      - name: "7/8 Publish URLs + Credentials Summary"
+        run: |
+          set -Eeuo pipefail
+          PRIMARY="$CF_URL"
+          if [ -z "$PRIMARY" ]; then PRIMARY="$NGROK_URL"; fi
+          {
+            echo "## OpenClaw (macOS) - LIVE"
+            echo ""
+            if [ -n "$CF_URL" ]; then echo "**Cloudflare URL:** $CF_URL"; echo ""; fi
+            if [ -n "$NGROK_URL" ]; then echo "**ngrok URL:** $NGROK_URL (free plan: pehle Visit Site click karo)"; echo ""; fi
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Primary URL | $PRIMARY |"
+            echo "| Username | **$AUTH_USER** |"
+            echo "| Password | **$AUTH_PASS** |"
+            echo "| Auth mode | $AUTH_MODE |"
+            echo "| Gateway | 127.0.0.1:18789 (password auth) |"
+            echo "| Edge proxy | 127.0.0.1:8080 (Basic-Auth) |"
+            echo "| Root access | ON - sandbox off + elevated + sudo |"
+            echo "| Model key | $MODEL_KEYVAR (set: $([ -n "$MODEL_KEY" ] && echo yes || echo no)) |"
+            echo "| Lives until | runner shutdown (~5.8h) |"
+            echo ""
+            echo "### Login flow"
+            echo "1. URL kholo -> browser auth popup -> username + password"
+            echo "2. OpenClaw Control UI khulega (gateway password = same password)"
+            if [ -z "$MODEL_KEY" ]; then
+              echo "3. Agent ke liye: Control UI > Settings > Model Providers mein API key daalo"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::OPENCLAW LIVE -> $PRIMARY | login: $AUTH_USER"
+
+      - name: "Failure Diagnostics (auto)"
+        if: failure()
+        run: |
+          echo "=== GATEWAY LOG (tail 60) ==="; tail -60 /tmp/openclaw-gw.log 2>/dev/null || true
+          echo "=== PROXY LOG ==="; tail -30 /tmp/proxy.log 2>/dev/null || true
+          echo "=== CLOUDFLARED ==="; tail -30 /tmp/cf.log 2>/dev/null || true
+          echo "=== NGROK ==="; tail -30 /tmp/ngrok.log 2>/dev/null || true
+          echo "=== NPM INSTALL ==="; tail -30 /tmp/npm-openclaw.log 2>/dev/null || true
+          echo "=== INSTALLER SCRIPT ==="; tail -30 /tmp/oc-install.log 2>/dev/null || true
+          echo "=== DOCTOR ==="; tail -40 /tmp/doctor.log 2>/dev/null || true
+          echo "=== CONFIG ==="; cat "$HOME/.openclaw/openclaw.json" 2>/dev/null | sed 's/"password":.*/"password": "***MASKED***"/' || true
+          echo "=== PROCESSES ==="; ps aux | grep -E "openclaw|cloudflared|ngrok|auth-proxy" | grep -v grep || true
+          echo "=== PORTS ==="; lsof -i :18789 -i :8080 2>/dev/null || true
+          echo "=== DISK ==="; df -h / | tail -1
+
+      - name: "Keep Alive (gateway + proxy auto-heal, ~5.8h)"
+        run: |
+          set -Eeuo pipefail
+          i=0
+          while [ "$i" -lt 348 ]; do
+            i=$((i + 1))
+            if ! curl -s -o /dev/null --max-time 3 http://127.0.0.1:18789; then
+              echo "::warning::min $i: gateway down - restarting"
+              nohup openclaw gateway --bind loopback --port 18789 >> /tmp/openclaw-gw.log 2>&1 &
+              echo $! > /tmp/gw.pid
+            fi
+            if ! curl -s -o /dev/null --max-time 3 http://127.0.0.1:8080; then
+              echo "::warning::min $i: auth proxy down - restarting"
+              nohup node /tmp/auth-proxy.js >> /tmp/proxy.log 2>&1 &
+            fi
+            if [ $((i % 30)) -eq 0 ]; then echo "keep-alive: $i/348 min - gateway + tunnels alive"; fi
+            sleep 60
+          done
