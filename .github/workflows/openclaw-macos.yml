@@ -21,6 +21,26 @@ on:
         description: "Model API key (optional)"
         required: false
         default: ""
+      custom_provider_id:
+        description: "Custom provider id (custom mode only)"
+        required: false
+        default: ""
+      custom_base_url:
+        description: "Custom OpenAI-compatible base URL (custom mode only)"
+        required: false
+        default: ""
+      custom_api_type:
+        description: "Custom API type: openai-completions | openai-responses"
+        required: false
+        default: "openai-completions"
+      custom_model_id:
+        description: "Exact model id (custom mode only)"
+        required: false
+        default: ""
+      custom_api_key:
+        description: "Custom provider API key (optional)"
+        required: false
+        default: ""
       ngrok_authtoken:
         description: "ngrok authtoken (empty = repo secret NGROK_AUTHTOKEN)"
         required: false
@@ -35,7 +55,7 @@ concurrency:
 
 jobs:
   openclaw:
-    runs-on: macos-latest
+    runs-on: macos-15
     timeout-minutes: 355
     env:
       ENABLE_CF: "1"
@@ -44,7 +64,7 @@ jobs:
       - name: "0/8 Preflight (macOS + root check)"
         run: |
           set -Eeuo pipefail
-          echo "::notice::OpenClaw Deployer v2026.6.0 // macOS // dual-tunnel // root-mode"
+          echo "::notice::OpenClaw Deployer v2026.6.3 // macOS // dual-tunnel // root-mode"
           sw_vers || true
           echo "arch: $(uname -m) | runner: $RUNNER_NAME"
           echo "ARCH=$(uname -m)" >> "$GITHUB_ENV"
@@ -63,6 +83,11 @@ jobs:
           IN_PASS: ${{ inputs.auth_password }}
           IN_MPROV: ${{ inputs.model_provider }}
           IN_MKEY: ${{ inputs.model_api_key }}
+          IN_CPID: ${{ inputs.custom_provider_id }}
+          IN_CURL: ${{ inputs.custom_base_url }}
+          IN_CAPI: ${{ inputs.custom_api_type }}
+          IN_CMID: ${{ inputs.custom_model_id }}
+          IN_CKEY: ${{ inputs.custom_api_key }}
         run: |
           set -Eeuo pipefail
           if [ -n "$IN_USER" ] && [ -n "$IN_PASS" ]; then
@@ -104,6 +129,29 @@ jobs:
             echo "MODEL_KEY=" >> "$GITHUB_ENV"
             echo "::notice::No model key - Control UI > Settings se baad mein daal sakte ho"
           fi
+          CP_ID="$(printf '%s' "$IN_CPID" | tr -dc 'a-zA-Z0-9_-')"
+          CP_URL="$IN_CURL"
+          CP_API="$(printf '%s' "$IN_CAPI" | tr -dc 'a-z-')"
+          CP_MODEL="$IN_CMID"
+          CP_KEY="$IN_CKEY"
+          if [ "$IN_MPROV" = "custom" ]; then
+            if [ -z "$CP_ID" ]; then echo "::error::Custom provider mode: provider ID required (a-z 0-9 _ -)"; exit 1; fi
+            if [ -z "$CP_URL" ]; then echo "::error::Custom provider mode: Base URL required"; exit 1; fi
+            if [ -z "$CP_MODEL" ]; then echo "::error::Custom provider mode: exact Model ID required"; exit 1; fi
+            case "$CP_API" in
+              openai-completions|openai-responses) ;;
+              *) echo "::error::Custom API type must be openai-completions or openai-responses (got: $CP_API)"; exit 1 ;;
+            esac
+            [ -n "$CP_KEY" ] && echo "::add-mask::$CP_KEY"
+            echo "::notice::Custom provider mode: $CP_ID -> $CP_URL ($CP_API), model: $CP_MODEL"
+          fi
+          {
+            echo "CUSTOM_ID=$CP_ID"
+            echo "CUSTOM_URL=$CP_URL"
+            echo "CUSTOM_API=$CP_API"
+            echo "CUSTOM_MODEL=$CP_MODEL"
+            echo "CUSTOM_KEY=$CP_KEY"
+          } >> "$GITHUB_ENV"
 
       - name: "3/8 Install OpenClaw (npm + official fallback)"
         run: |
@@ -128,9 +176,68 @@ jobs:
           echo "OPENCLAW_BIN=$(command -v openclaw)" >> "$GITHUB_ENV"
           echo "::notice::OpenClaw installed at $(command -v openclaw)"
 
+      - name: "3b/8 Patch Control UI (Add-provider form reconnect fix)"
+        run: |
+          set -Eeuo pipefail
+          cat > /tmp/patch_control_ui.py <<'UIPATCH'
+          import glob, os, re, sys
+          BT = chr(96)
+          OLD = ",this.addProviderOpen=!1,this.addProviderId=" + BT + BT + ",this.addProviderKey=" + BT + BT + "}"
+          NEW = "}"
+          NEXT_FN = "resolveSelectedAgentId()"
+          def patch_file(path):
+              src = open(path, encoding="utf-8", errors="ignore").read()
+              before_init = src.count("this.addProviderOpen=!1")
+              before_clears = src.count(OLD)
+              if before_clears == 0:
+                  i = src.find("resetAgentScopeState(){")
+                  j = src.find(NEXT_FN, i)
+                  ok = i >= 0 and j > i and "addProvider" not in src[i:j]
+                  return ("skip" if ok else "nomatch"), before_clears, 0
+              patched, n = re.subn(re.escape(OLD), NEW, src)
+              if n != 1 or before_init != 2:
+                  return ("unexpected-count", before_clears, n)
+              i = patched.find("resetAgentScopeState(){")
+              j = patched.find(NEXT_FN, i)
+              if j <= i or "addProvider" in patched[i:j]:
+                  return ("verify-fail", before_clears, n)
+              if patched.count("this.addProviderOpen=!1") != before_init - 1:
+                  return ("init-count-fail", before_clears, n)
+              open(path, "w", encoding="utf-8").write(patched)
+              return ("patched", before_clears, n)
+          def main():
+              roots = sys.argv[1:]
+              patched = skipped = failed = 0
+              for root in roots:
+                  for path in glob.glob(os.path.join(root, "model-providers-page-*.js")):
+                      status, b, n = patch_file(path)
+                      print("[ui-patch] " + os.path.basename(path) + ": " + status + " (clears_before=" + str(b) + ", replaced=" + str(n) + ")")
+                      if status == "patched":
+                          patched += 1
+                      elif status == "skip":
+                          skipped += 1
+                      else:
+                          failed += 1
+              print("[ui-patch] done: patched=" + str(patched) + " skipped=" + str(skipped) + " failed=" + str(failed))
+              sys.exit(0 if (patched + skipped) > 0 and failed == 0 else 1)
+          if __name__ == "__main__":
+              main()
+          UIPATCH
+          OCROOT="$(npm root -g)/openclaw/dist/control-ui/assets"
+          if python3 /tmp/patch_control_ui.py "$OCROOT"; then
+            echo "::notice::Control UI patched: Add-provider form ab reconnect/catalog-refresh pe close nahi hoga, draft preserve rahega"
+          else
+            echo "::warning::Control UI patch skipped (bundle structure upstream badla hai) - deploy continue, UI bug fix applied nahi"
+          fi
+
       - name: "4/8 Configure OpenClaw (password auth + ROOT mode)"
         env:
           MODEL_KEYVAR: ${{ env.MODEL_KEYVAR }}
+          CUSTOM_ID: ${{ env.CUSTOM_ID }}
+          CUSTOM_URL: ${{ env.CUSTOM_URL }}
+          CUSTOM_API: ${{ env.CUSTOM_API }}
+          CUSTOM_MODEL: ${{ env.CUSTOM_MODEL }}
+          CUSTOM_KEY: ${{ env.CUSTOM_KEY }}
         run: |
           set -Eeuo pipefail
           mkdir -p "$HOME/.openclaw/workspace"
@@ -151,6 +258,19 @@ jobs:
               "auth": {"mode": "password", "password": os.environ["AUTH_PASS"]}
             }
           }
+          cp_id = os.environ.get("CUSTOM_ID", "").strip()
+          if cp_id:
+            cp_model = os.environ.get("CUSTOM_MODEL", "").strip()
+            prov = {
+              "baseUrl": os.environ.get("CUSTOM_URL", "").strip(),
+              "api": os.environ.get("CUSTOM_API", "openai-completions").strip(),
+              "models": [{"id": cp_model, "name": cp_model, "reasoning": False, "input": ["text"], "contextWindow": 128000, "maxTokens": 8192}]
+            }
+            if os.environ.get("CUSTOM_KEY", "").strip():
+              prov["apiKey"] = os.environ.get("CUSTOM_KEY", "").strip()
+            cfg["models"] = {"providers": {cp_id: prov}}
+            cfg["agents"]["defaults"]["model"] = {"primary": cp_id + "/" + cp_model}
+            print("custom provider configured:", cp_id, "->", prov["baseUrl"], "model:", cp_model)
           p = os.path.expanduser("~/.openclaw/openclaw.json")
           os.makedirs(os.path.dirname(p), exist_ok=True)
           with open(p, "w") as f:
@@ -202,6 +322,7 @@ jobs:
           const USER = process.env.AUTH_USER || '';
           const PASS = process.env.AUTH_PASS || '';
           const GH = '127.0.0.1', GP = 18789, LP = 8080;
+          const sessions = new Set();
           function check(auth) {
             if (!USER || !PASS) return false;
             if (!auth || auth.indexOf('Basic ') !== 0) return false;
@@ -214,16 +335,46 @@ jobs:
             const b = Buffer.from(USER + ':' + PASS);
             return a.length === b.length && crypto.timingSafeEqual(a, b);
           }
+          function sessFromCookie(req) {
+            const c = req.headers.cookie || '';
+            const parts = c.split(';');
+            for (let i = 0; i < parts.length; i++) {
+              const kv = parts[i].trim().split('=');
+              if (kv[0] === 'ocauth' && kv[1] && sessions.has(kv[1])) return kv[1];
+            }
+            return '';
+          }
+          function newSession() {
+            const t = crypto.randomBytes(24).toString('hex');
+            sessions.add(t);
+            if (sessions.size > 400) sessions.delete(sessions.values().next().value);
+            return t;
+          }
           function deny(res) {
             res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="OpenClaw"', 'Content-Type': 'text/html; charset=utf-8' });
             res.end('<html><body style="background:#05080a;color:#00ff9d;font-family:monospace;padding:40px"><h1>401 — OpenClaw</h1><p>Auth required. Browser popup mein username + password daalo.</p></body></html>');
           }
           const server = http.createServer(function (req, res) {
-            if (!check(req.headers.authorization)) { deny(res); return; }
+            let sess = sessFromCookie(req);
+            if (!sess && check(req.headers.authorization)) {
+              sess = newSession();
+              res.setHeader('Set-Cookie', 'ocauth=' + sess + '; Path=/; Max-Age=21600; HttpOnly; SameSite=Lax; Secure');
+            }
+            if (!sess) { deny(res); return; }
             const h = Object.assign({}, req.headers);
             h['host'] = GH + ':' + GP;
             h['origin'] = 'http://' + GH + ':' + GP;
             h['referer'] = 'http://' + GH + ':' + GP;
+            delete h['x-forwarded-for'];
+            delete h['x-forwarded-proto'];
+            delete h['x-forwarded-host'];
+            delete h['x-forwarded-port'];
+            delete h['x-real-ip'];
+            delete h['forwarded'];
+            delete h['cf-connecting-ip'];
+            delete h['cf-ray'];
+            delete h['cf-ipcountry'];
+            delete h['true-client-ip'];
             const preq = http.request({ host: GH, port: GP, path: req.url, method: req.method, headers: h }, function (pres) {
               res.writeHead(pres.statusCode || 502, pres.headers);
               pres.pipe(res);
@@ -232,12 +383,13 @@ jobs:
             req.pipe(preq);
           });
           server.on('upgrade', function (req, socket, head) {
-            if (!check(req.headers.authorization)) { socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n'); return; }
+            if (!sessFromCookie(req) && !check(req.headers.authorization)) { socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n'); return; }
             const lines = [];
             const rh = req.rawHeaders;
             for (let i = 0; i < rh.length; i += 2) {
               const n = rh[i].toLowerCase();
               if (n === 'origin' || n === 'host' || n === 'referer') continue;
+              if (n === 'x-forwarded-for' || n === 'x-forwarded-proto' || n === 'x-forwarded-host' || n === 'x-forwarded-port' || n === 'x-real-ip' || n === 'forwarded' || n === 'cf-connecting-ip' || n === 'cf-ray' || n === 'cf-ipcountry' || n === 'true-client-ip') continue;
               lines.push(rh[i] + ': ' + rh[i + 1]);
             }
             lines.push('Host: ' + GH + ':' + GP);
@@ -269,7 +421,14 @@ jobs:
             tail -25 /tmp/proxy.log || true
             exit 1
           fi
-          echo "::notice::Auth proxy verified: no-creds=401, with-creds=$code2 (gateway chain OK)"
+          echo "::notice::Auth proxy verified: no-creds=401, with-creds=$code2 (gateway chain OK, session cookie active)"
+          code3="$(curl -s -u "$AUTH_USER:$AUTH_PASS" -H 'X-Forwarded-For: 203.0.113.77' -H 'X-Forwarded-Proto: https' -H 'CF-Connecting-IP: 203.0.113.77' -o /dev/null -w '%{http_code}' --max-time 8 http://127.0.0.1:8080/ || true)"
+          if [ "$code3" != "200" ]; then
+            echo "::error::XFF-sim check failed (tunnel-sim request got: $code3) - gateway attribution reject ho raha hai"
+            tail -25 /tmp/proxy.log || true
+            exit 1
+          fi
+          echo "::notice::XFF-sim check passed: forwarded headers stripped at proxy, gateway attribution clear ($code3)"
 
       - name: "6/8 Tunnels (Cloudflare + ngrok) + URLs"
         env:
@@ -374,6 +533,8 @@ jobs:
             echo "| Edge proxy | 127.0.0.1:8080 (Basic-Auth) |"
             echo "| Root access | ON - sandbox off + elevated + sudo |"
             echo "| Model key | $MODEL_KEYVAR (set: $([ -n "$MODEL_KEY" ] && echo yes || echo no)) |"
+            echo "| Custom provider | $([ -n "$CUSTOM_ID" ] && echo "$CUSTOM_ID -> $CUSTOM_URL ($CUSTOM_API) model: $CUSTOM_MODEL" || echo none) |"
+            echo "| UI patch | Add-provider form reconnect fix (model-providers bundle) |"
             echo "| Lives until | runner shutdown (~5.8h) |"
             echo ""
             echo "### Login flow"
